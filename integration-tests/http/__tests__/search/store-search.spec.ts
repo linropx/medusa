@@ -15,7 +15,9 @@ jest.setTimeout(120000)
  * adapter posts against the indexes a middleware opted in, and only falls back
  * to `query.graph` for fields an index doesn't hold.
  *
- * The app under test opts in `product` only — see its `src/api/middlewares.ts`.
+ * The app under test opts in `product` only, under a `published` filter — see
+ * its `src/api/middlewares.ts`. The sales channel scoping on top of that is the
+ * endpoint's own, applied because the index declares `sales_channel_ids`.
  */
 medusaIntegrationTestRunner({
   testSuite: ({ dbConnection, getContainer, api }) => {
@@ -195,8 +197,8 @@ medusaIntegrationTestRunner({
           expect.objectContaining({ id: customer.id }),
         ])
 
-        // Only `product` is passed to `allowSearchIndexes`, and an index the
-        // store hasn't exposed is answered like one that doesn't exist.
+        // Only `product` is in `allowed_indexes`, and an index the store hasn't
+        // exposed is answered like one that doesn't exist.
         const error = await search({
           queries: [{ entity: "customer" }],
         }).catch((e) => e)
@@ -218,18 +220,46 @@ medusaIntegrationTestRunner({
         )
       })
 
-      it("applies no filters of its own", async () => {
+      it("applies the store's configured filters", async () => {
         const response = await search({
           queries: [{ entity: "product", filters: { q: "zephyr" } }],
         })
 
         expect(response.status).toEqual(200)
-        // The draft and the product living in another sales channel both come
-        // back: narrowing what a storefront may reach is the store's to add,
-        // through a middleware on the route.
-        expect(
-          response.data.results[0].hits.map((hit) => hit.id).sort()
-        ).toEqual([shirt.id, draft.id, hidden.id].sort())
+        // "Zephyr Draft" is out on the middleware's `published` filter, and
+        // "Zephyr Elsewhere" on the endpoint's own sales channel scoping.
+        expect(response.data.results[0].hits).toEqual([
+          expect.objectContaining({ id: shirt.id }),
+        ])
+      })
+
+      it("scopes products to the key's sales channels on its own", async () => {
+        const response = await search({
+          queries: [
+            { entity: "product", filters: { handle: "zephyr-elsewhere" } },
+          ],
+        })
+
+        expect(response.status).toEqual(200)
+        // Published, and nothing in the middleware's config excludes it — only
+        // the sales channel it lives in does.
+        expect(response.data.results[0].hits).toEqual([])
+      })
+
+      it("can't widen past what the store configured", async () => {
+        const response = await search({
+          queries: [
+            { entity: "product", filters: { status: "draft" } },
+            {
+              entity: "product",
+              filters: { sales_channel_ids: otherSalesChannel.id },
+            },
+          ],
+        })
+
+        expect(response.status).toEqual(200)
+        expect(response.data.results[0].hits).toEqual([])
+        expect(response.data.results[1].hits).toEqual([])
       })
 
       it("hydrates fields the index doesn't hold", async () => {
@@ -299,7 +329,7 @@ medusaIntegrationTestRunner({
 
         expect(second.data.results[0].hits).toEqual([
           expect.objectContaining({
-            document: expect.objectContaining({ title: "Zephyr Draft" }),
+            document: expect.objectContaining({ title: "Zephyr Shirt" }),
           }),
         ])
         expect(second.data.results[0].metadata.skip).toEqual(1)
@@ -318,10 +348,7 @@ medusaIntegrationTestRunner({
         expect(response.status).toEqual(200)
         expect(response.data.results[0].facets.status).toEqual({
           type: "value",
-          values: expect.arrayContaining([
-            { value: "published", count: 3 },
-            { value: "draft", count: 1 },
-          ]),
+          values: [{ value: "published", count: 2 }],
         })
       })
 

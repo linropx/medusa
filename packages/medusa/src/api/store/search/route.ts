@@ -1,30 +1,41 @@
 import {
-  AllowedSearchIndexes,
+  ConfiguredStoreSearch,
   MedusaResponse,
   MedusaStoreRequest,
 } from "@medusajs/framework/http"
-import { HttpTypes, SearchTypes } from "@medusajs/framework/types"
+import { HttpTypes, Logger, SearchTypes } from "@medusajs/framework/types"
 import {
   ContainerRegistrationKeys,
   MedusaError,
   Modules,
+  isPresent,
 } from "@medusajs/framework/utils"
 
+const PRODUCT_ENTITY = "product"
+
 /**
- * Searches the store's search indexes and answers with the engine's own results
- * — hits, scores, highlights, and facets — which is the contract InstantSearch's
- * search client is built on.
- *
- * Each query names the index it runs against, and a batch is resolved in one
- * round-trip to the engine.
+ * The field a product index is expected to flatten its sales channels into, as
+ * `sales_channels.id` is a relation rather than something an engine can filter.
+ */
+const SALES_CHANNEL_FIELD = "sales_channel_ids"
+
+/**
+ * Warned once per index: a definition cannot change under a running process, so
+ * repeating it on every search would only be noise.
+ */
+const unscopedProductIndexes = new Set<string>()
+
+/**
+ * Answers with the engine's own results — hits, scores, highlights, facets —
+ * which is the contract InstantSearch's search client is built on. Each query
+ * names its index, and a batch resolves in one round-trip.
  *
  * Nothing is searchable until a middleware opts an index in with
- * `allowSearchIndexes`. Within an allowed index the queries run as posted, so
- * narrowing further — a sales channel, a published status — is applied by a
- * middleware that edits `req.validatedBody`.
+ * `configureStoreSearch`, which is also where a store narrows what a query may
+ * reach within an allowed index.
  */
 export const POST = async (
-  req: MedusaStoreRequest<HttpTypes.StoreSearch> & AllowedSearchIndexes,
+  req: MedusaStoreRequest<HttpTypes.StoreSearch> & ConfiguredStoreSearch,
   res: MedusaResponse<HttpTypes.StoreSearchResponse>
 ) => {
   const query = req.scope.resolve(ContainerRegistrationKeys.QUERY)
@@ -40,18 +51,19 @@ export const POST = async (
     )
   }
 
-  const allowed = new Set(req.allowedSearchIndexes ?? [])
+  const allowed = req.storeSearchConfig?.allowed_indexes ?? {}
 
   const body = req.validatedBody
   const queries = "queries" in body ? body.queries : [body]
 
   const plans = queries.map(({ entity, fields }) => {
-    // An index the store hasn't opted in is answered exactly like one that
-    // doesn't exist, so the endpoint never tells a client what it holds. The
-    // reason goes to the log instead, for whoever configured the route.
-    if (!allowed.has(entity)) {
+    const config = allowed[entity]
+
+    // Answered exactly like an index that doesn't exist, so the endpoint never
+    // tells a client what the store holds.
+    if (!config) {
       logger.warn(
-        `Search index "${entity}" is not exposed on /store/search. Opt it in with the \`allowSearchIndexes\` middleware.`
+        `Search index "${entity}" is not exposed on /store/search. Opt it in with the \`configureStoreSearch\` middleware.`
       )
 
       throw notFound(entity)
@@ -61,8 +73,7 @@ export const POST = async (
     try {
       index = searchModule.getIndex(entity)
     } catch {
-      // Rethrown rather than passed through: the module's message names every
-      // registered index, which is not a storefront's to know.
+      // The module's own message names every registered index.
       throw notFound(entity)
     }
 
@@ -70,17 +81,25 @@ export const POST = async (
 
     return {
       primaryKey: index.primary_key,
-      // Whatever the index can't serve is fetched by `query.search` through
-      // `query.graph`. Left unset, `fields` defaults to the index' own.
+      salesChannelFilter: buildSalesChannelFilter(index, req, logger),
+      filters: config === true ? undefined : config.filters,
+      // Left unset, `fields` defaults to the index' own, so nothing to hydrate.
       withHydration: !!fields?.some((field) => !retrievable.has(field)),
     }
   })
 
+  // `locale` only reaches the hydration — what the index returns is whatever
+  // the seed wrote.
   const results = await query.search(
-    queries,
-    // Only reaches the hydration: what the index itself returns is whatever the
-    // seed wrote, so an index serving several locales stores them as its own
-    // fields.
+    queries.map((searchQuery, i) => ({
+      ...searchQuery,
+      // Requested last, so its `q` wins over anything the store configured.
+      filters: mergeSearchFilters(
+        plans[i].salesChannelFilter,
+        plans[i].filters,
+        searchQuery.filters
+      ),
+    })),
     { locale: req.locale }
   )
 
@@ -92,8 +111,6 @@ export const POST = async (
         return searchResult
       }
 
-      // The engine only returned the fields the index holds, so the hit carries
-      // the hydrated entity instead, matched back by the primary key.
       const hydrated = new Map(data.map((entry) => [entry[primaryKey], entry]))
 
       return {
@@ -112,3 +129,76 @@ const notFound = (entity: string) =>
     MedusaError.Types.NOT_FOUND,
     `No search index named "${entity}"`
   )
+
+/**
+ * Scopes a product index to the sales channels the publishable key is bound to,
+ * which is what `/store/products` does for every other product read. Applied
+ * only when the index declares the field as filterable — an index that shapes
+ * its sales channels differently is left to the middleware's own `filters`.
+ */
+function buildSalesChannelFilter(
+  index: SearchTypes.ResolvedSearchIndexDefinition,
+  req: MedusaStoreRequest,
+  logger: Logger
+): SearchTypes.SearchFilters | undefined {
+  if (index.entity !== PRODUCT_ENTITY) {
+    return undefined
+  }
+
+  if (index.fields[SALES_CHANNEL_FIELD]?.filterable !== true) {
+    if (!unscopedProductIndexes.has(index.name)) {
+      unscopedProductIndexes.add(index.name)
+
+      logger.warn(
+        `Search index "${index.name}" holds products but declares no filterable "${SALES_CHANNEL_FIELD}", so /store/search serves it across every sales channel. Add the field to the index, or scope it through the \`filters\` of \`configureStoreSearch\`.`
+      )
+    }
+
+    return undefined
+  }
+
+  const salesChannelIds = req.publishable_key_context.sales_channel_ids
+
+  if (!salesChannelIds.length) {
+    throw new MedusaError(
+      MedusaError.Types.INVALID_DATA,
+      `Publishable key needs to have a sales channel configured`
+    )
+  }
+
+  return { [SALES_CHANNEL_FIELD]: salesChannelIds }
+}
+
+/**
+ * ANDs the filters together, so a query can narrow its own results but never
+ * widen past what the endpoint and the store allow. `q` stays at the top level,
+ * which is where the Search Module lifts it out of, and the last one given wins.
+ */
+function mergeSearchFilters(
+  ...filters: (SearchTypes.SearchFilters | undefined)[]
+): SearchTypes.SearchFilters | undefined {
+  const present = filters.filter(isPresent) as SearchTypes.SearchFilters[]
+
+  if (present.length < 2) {
+    return present[0]
+  }
+
+  let q: string | undefined
+  const branches: SearchTypes.SearchFilters[] = []
+
+  for (const filter of present) {
+    const { q: filterQuery, ...rest } = filter
+
+    if (filterQuery !== undefined) {
+      q = filterQuery
+    }
+    if (isPresent(rest)) {
+      branches.push(rest)
+    }
+  }
+
+  return {
+    ...(isPresent(q) ? { q } : {}),
+    ...(branches.length > 1 ? { $and: branches } : branches[0] ?? {}),
+  }
+}

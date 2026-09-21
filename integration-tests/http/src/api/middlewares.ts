@@ -1,4 +1,7 @@
-import { allowSearchIndexes, defineMiddlewares } from "@medusajs/framework/http"
+import {
+  configureStoreSearch,
+  defineMiddlewares,
+} from "@medusajs/framework/http"
 
 /**
  * The search fixture registers a `customer` index too, and it is deliberately
@@ -9,7 +12,13 @@ export default defineMiddlewares({
   routes: [
     {
       matcher: "/store/search",
-      middlewares: [allowSearchIndexes("product")],
+      middlewares: [
+        configureStoreSearch({
+          allowed_indexes: {
+            product: { filters: { status: "published" } },
+          },
+        }),
+      ],
     },
   ],
 })

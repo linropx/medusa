@@ -163,7 +163,15 @@ The route is responsible for storefront constraints (sales channel, region, whic
 
 `POST /store/search` implements this contract over every registered index, so `indexName` is the index a query runs against. It hydrates the fields an index doesn't hold onto each hit's `document`, and otherwise runs the queries as posted.
 
-It applies no constraints of its own: scoping a storefront to a sales channel, to published documents, or to a subset of the indexes is the store's own, through a middleware on the route.
+It exposes nothing by default, and scopes a product index to the publishable key's sales channels on its own when the index declares a filterable `sales_channel_ids`. A `configureStoreSearch` middleware on the route names the indexes a storefront may query and the filters ANDed onto every query for each, so a client can narrow its own results but never widen past them:
+
+```ts
+configureStoreSearch({
+  allowed_indexes: {
+    product: { filters: { status: "published" } },
+  },
+})
+```
 
 ## Widget support
 
